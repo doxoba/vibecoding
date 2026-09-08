@@ -81,7 +81,8 @@
   .pill-menu-label{font-size:.72em; font-weight:700; color:var(--text-muted); display:block; margin-bottom:6px;}
   .other-menu-label{font-size:.72em; font-weight:700; color:var(--text-muted); margin:10px 0 4px;}
   .other-menu-list{margin:0; padding-left:18px; font-size:.9em; line-height:1.6;}
-  .result-actions{display:flex; gap:8px; margin-top:14px;}
+  .result-actions{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px;}
+  .result-actions .btn{min-width:90px;}
   .btn{
     flex:1; padding:10px; border-radius:10px; border:1px solid var(--border); background:var(--chip-bg);
     color:var(--text); font-weight:700; font-size:.88em; cursor:pointer; text-align:center; text-decoration:none;
@@ -170,6 +171,7 @@
     <ul class="other-menu-list" id="resultOther"></ul>
     <div class="result-actions">
       <button class="btn primary" id="rerollBtn" type="button">다시 뽑기</button>
+      <a class="btn" id="resultDirectionsLink" href="#" target="_blank" rel="noopener" hidden>길찾기</a>
       <a class="btn" id="resultMapLink" href="#" target="_blank" rel="noopener">지도에서 보기</a>
     </div>
   </div>
@@ -206,7 +208,8 @@
     RAIL_STATION_A_QUERY: '가산디지털단지역',
     RAIL_STATION_B_QUERY: '독산역',
     STORAGE_PREFIX: 'lunch-recommender:v1:',
-    SDK_LOAD_TIMEOUT_MS: 4000
+    SDK_LOAD_TIMEOUT_MS: 4000,
+    WALK_SPEED_M_PER_MIN: 67 // 성인 평균 도보 속도(시속 약 4km) 기준 대략치. 실제 경로 기반이 아닌 직선거리 추정.
   };
 
   var TYPE_OPTIONS = ['면','밥','국물','구이','튀김','분식','기타'];
@@ -265,7 +268,9 @@
     recentIds: [],
     officeSign: null,
     railAvailable: false,
-    map: null
+    map: null,
+    highlightMarker: null,
+    highlightInfoWindow: null
   };
 
   // ============ utils ============
@@ -454,13 +459,8 @@
         stationA = stations[0]; stationB = stations[1];
         state.railAvailable = true;
         state.officeSign = crossSign(stationA, stationB, officeCoord);
-        console.log('[lunch-recommender][debug] officeCoord=' + JSON.stringify(officeCoord) +
-          ' stationA(가산디지털단지역)=' + JSON.stringify(stationA) +
-          ' stationB(독산역)=' + JSON.stringify(stationB) +
-          ' officeSign=' + state.officeSign);
       } else {
         state.railAvailable = false;
-        console.log('[lunch-recommender][debug] rail station lookup failed — railAvailable=false');
       }
       return categorySearchAll(places, officeCoord, CONFIG.RADIUS_M);
     }).then(function(raw){
@@ -469,11 +469,6 @@
         var distanceM = p.distance ? Number(p.distance) : Math.round(haversine(officeCoord, {lat:lat,lng:lng}));
         var side = state.railAvailable ? crossSign(stationA, stationB, {lat:lat,lng:lng}) : null;
         var includedByGeometry = distanceM <= CONFIG.RADIUS_M && (!state.railAvailable || side === state.officeSign);
-        if(/마리오/.test(p.place_name)){
-          console.log('[lunch-recommender][debug] ' + p.place_name + ' | lat=' + lat + ' lng=' + lng +
-            ' distanceM=' + distanceM + ' side=' + side + ' officeSign=' + state.officeSign +
-            ' includedByGeometry=' + includedByGeometry);
-        }
         return {
           id: 'kakao:' + p.id, source:'kakao', name: p.place_name, categoryName: p.category_name,
           phone: p.phone, address: p.road_address_name || p.address_name, lat: lat, lng: lng,
@@ -492,6 +487,8 @@
     var center = new kakao.maps.LatLng(officeCoord.lat, officeCoord.lng);
     var map = new kakao.maps.Map(container, { center:center, level:4 });
     state.map = map;
+    state.highlightMarker = null; // 지도를 새로 만들었으니 이전 하이라이트 참조는 무효
+    state.highlightInfoWindow = null;
     new kakao.maps.Marker({ position:center, map:map });
     new kakao.maps.Circle({
       center:center, radius:CONFIG.RADIUS_M, strokeWeight:2, strokeColor:'#ff6b35', strokeOpacity:.8,
@@ -504,6 +501,33 @@
       var iw = new kakao.maps.InfoWindow({ content:'<div style="padding:4px 8px;font-size:12px;white-space:nowrap;">'+r.name+'</div>' });
       kakao.maps.event.addListener(marker, 'click', function(){ iw.open(map, marker); });
     });
+  }
+
+  // 추천 결과 마커를 눈에 띄는 핀으로 표시하고 지도 중심을 그쪽으로 이동시킨다.
+  var highlightMarkerImage = null;
+  function getHighlightMarkerImage(){
+    if(highlightMarkerImage) return highlightMarkerImage;
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="46" viewBox="0 0 36 46">' +
+      '<path d="M18 0C8 0 0 8 0 18c0 12.5 18 28 18 28s18-15.5 18-28C36 8 28 0 18 0z" fill="#ff6b35" stroke="#ffffff" stroke-width="2"/>' +
+      '<circle cx="18" cy="18" r="7" fill="#ffffff"/></svg>';
+    var uri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    highlightMarkerImage = new kakao.maps.MarkerImage(uri, new kakao.maps.Size(36,46), { offset: new kakao.maps.Point(18,46) });
+    return highlightMarkerImage;
+  }
+  function highlightResult(r){
+    if(state.mode !== 'live' || !state.map || !r || r.lat == null || r.lng == null) return;
+    if(state.highlightMarker){ state.highlightMarker.setMap(null); }
+    if(state.highlightInfoWindow){ state.highlightInfoWindow.close(); }
+    var pos = new kakao.maps.LatLng(r.lat, r.lng);
+    var marker = new kakao.maps.Marker({ position:pos, map:state.map, image:getHighlightMarkerImage(), zIndex:10 });
+    var iw = new kakao.maps.InfoWindow({
+      content:'<div style="padding:6px 10px;font-size:12px;font-weight:700;white-space:nowrap;">'+r.name+'</div>',
+      zIndex:10
+    });
+    iw.open(state.map, marker);
+    state.highlightMarker = marker;
+    state.highlightInfoWindow = iw;
+    state.map.panTo(pos);
   }
 
   // ============ 필터/추천 ============
@@ -572,7 +596,11 @@
     $('resultName').textContent = r.name;
     var metaParts = [];
     if(r.categoryName) metaParts.push(r.categoryName.replace(/^음식점\s*>\s*/,''));
-    if(r.distanceM != null) metaParts.push(r.distanceM + 'm');
+    if(r.distanceM != null){
+      metaParts.push(r.distanceM + 'm');
+      var walkMin = Math.max(1, Math.round(r.distanceM / CONFIG.WALK_SPEED_M_PER_MIN));
+      metaParts.push('도보 약 ' + walkMin + '분');
+    }
     $('resultMeta').textContent = metaParts.join(' · ');
     $('resultSignature').textContent = r.signatureMenu || '(추천메뉴 미입력 — 아래 목록에서 편집해주세요)';
     var ul = $('resultOther'); ul.innerHTML = '';
@@ -581,10 +609,19 @@
     var link = $('resultMapLink');
     if(r.placeUrl){ link.href = r.placeUrl; link.style.display = ''; }
     else { link.href = 'https://map.kakao.com/?q=' + encodeURIComponent(r.name); link.style.display = ''; }
+    // 길찾기: 카카오맵 공식 딥링크. 클릭하면 카카오맵에서 실제 경로·별점·리뷰까지 볼 수 있다.
+    var dirLink = $('resultDirectionsLink');
+    if(r.lat != null && r.lng != null){
+      dirLink.href = 'https://map.kakao.com/link/to/' + encodeURIComponent(r.name) + ',' + r.lat + ',' + r.lng;
+      dirLink.hidden = false;
+    } else {
+      dirLink.hidden = true;
+    }
   }
   function onRecommend(){
     var r = pickRandom();
     renderResult(r);
+    highlightResult(r);
   }
 
   function renderList(){
