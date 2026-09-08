@@ -405,11 +405,22 @@
     });
   }
 
-  function keywordFirst(places, query){
+  // 카카오 키워드 검색은 관련도 순으로 여러 결과를 주는데, "가산디지털단지역" 같은
+  // 환승역은 노선별로 여러 건(1호선/7호선 등)이 나오고 순서도 뒤섞여 있다.
+  // 철길 판정 기준은 반드시 1호선이어야 하므로 category_name/place_name에
+  // preferKeyword(예: "1호선")가 포함된 결과를 우선으로 고른다.
+  function keywordFirst(places, query, preferKeyword){
     return new Promise(function(resolve, reject){
       places.keywordSearch(query, function(data, status){
         if(status === kakao.maps.services.Status.OK && data[0]){
-          resolve({ lat:+data[0].y, lng:+data[0].x });
+          var picked = data[0];
+          if(preferKeyword){
+            for(var i=0;i<data.length;i++){
+              var hay = (data[i].category_name||'') + ' ' + (data[i].place_name||'');
+              if(hay.indexOf(preferKeyword) !== -1){ picked = data[i]; break; }
+            }
+          }
+          resolve({ lat:+picked.y, lng:+picked.x });
         } else { reject(new Error('keyword search failed: ' + status)); }
       });
     });
@@ -435,8 +446,8 @@
     return geocodeAddress(geocoder, CONFIG.OFFICE_ADDRESS).then(function(coord){
       officeCoord = coord;
       return Promise.all([
-        keywordFirst(places, CONFIG.RAIL_STATION_A_QUERY),
-        keywordFirst(places, CONFIG.RAIL_STATION_B_QUERY)
+        keywordFirst(places, CONFIG.RAIL_STATION_A_QUERY, '1호선'),
+        keywordFirst(places, CONFIG.RAIL_STATION_B_QUERY, '1호선')
       ]).catch(function(){ return null; }); // 철길 판정 실패해도 전체 흐름은 계속
     }).then(function(stations){
       if(stations){
