@@ -454,10 +454,10 @@
         stationA = stations[0]; stationB = stations[1];
         state.railAvailable = true;
         state.officeSign = crossSign(stationA, stationB, officeCoord);
-        console.log('[lunch-recommender][debug] officeCoord=', officeCoord);
-        console.log('[lunch-recommender][debug] stationA(가산디지털단지역)=', stationA);
-        console.log('[lunch-recommender][debug] stationB(독산역)=', stationB);
-        console.log('[lunch-recommender][debug] officeSign=', state.officeSign);
+        console.log('[lunch-recommender][debug] officeCoord=' + JSON.stringify(officeCoord) +
+          ' stationA(가산디지털단지역)=' + JSON.stringify(stationA) +
+          ' stationB(독산역)=' + JSON.stringify(stationB) +
+          ' officeSign=' + state.officeSign);
       } else {
         state.railAvailable = false;
         console.log('[lunch-recommender][debug] rail station lookup failed — railAvailable=false');
@@ -470,7 +470,9 @@
         var side = state.railAvailable ? crossSign(stationA, stationB, {lat:lat,lng:lng}) : null;
         var includedByGeometry = distanceM <= CONFIG.RADIUS_M && (!state.railAvailable || side === state.officeSign);
         if(/마리오/.test(p.place_name)){
-          console.log('[lunch-recommender][debug]', p.place_name, { lat:lat, lng:lng, distanceM:distanceM, side:side, officeSign:state.officeSign, includedByGeometry:includedByGeometry });
+          console.log('[lunch-recommender][debug] ' + p.place_name + ' | lat=' + lat + ' lng=' + lng +
+            ' distanceM=' + distanceM + ' side=' + side + ' officeSign=' + state.officeSign +
+            ' includedByGeometry=' + includedByGeometry);
         }
         return {
           id: 'kakao:' + p.id, source:'kakao', name: p.place_name, categoryName: p.category_name,
