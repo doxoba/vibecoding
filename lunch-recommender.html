@@ -204,6 +204,14 @@
     padding:8px 16px; border-radius:var(--r-sm); font-size:13px; font-weight:600; cursor:pointer;
   }
   .btn.primary:hover{background:var(--accent-dark);}
+  .excluded-toggle{
+    display:block; width:100%; text-align:left; background:none; border:none;
+    border-top:1px dashed var(--border); color:var(--text-faint); font-size:11px;
+    padding:10px 0 0; margin-top:8px; cursor:pointer;
+  }
+  .excluded-toggle:hover{color:var(--text-muted);}
+  .excluded-wrap{display:none;}
+  .excluded-wrap.open{display:block;}
 
 </style>
 </head><body>
@@ -531,6 +539,44 @@
     });
   }
 
+  // 위경도 중심점에서 북/동 방향으로 dNorthM/dEastM(미터)만큼 떨어진 좌표를 근사 계산.
+  function offsetLatLng(center, dNorthM, dEastM){
+    var dLat = dNorthM / 111320;
+    var dLng = dEastM / (111320 * Math.cos(center.lat * Math.PI/180));
+    return { lat: center.lat + dLat, lng: center.lng + dLng };
+  }
+
+  // 카카오 Local API(categorySearch/keywordSearch)는 공식 문서상 "노출 가능 문서 수 최대: 45"로
+  // 하드 캡이 걸려 있다(페이지·사이즈를 아무리 조절해도 한 번의 검색으로는 45건을 못 넘김).
+  // 가산디지털단지처럼 반경 250m 안에 45곳이 넘는 밀집 상권에서는 중심 1곳만 검색하면 잘려나가는
+  // 식당이 생긴다. 그래서 원래 중심을 살짝 오프셋한 지점(중심+동서남북 4곳, 총 5곳)에서 서로 겹치는
+  // 더 작은 원으로 나눠 검색한 뒤 place id 기준으로 병합/중복제거해서 사실상의 45건 캡을 우회한다.
+  // (오프셋 0.6R + 서브반경 0.85R 조합은 원래 반경 R의 원 전체를 빈틈없이 커버하도록 계산된 값)
+  function buildSearchGrid(center, radius){
+    var offsetM = radius * 0.6;
+    var subRadius = Math.min(20000, Math.round(radius * 0.85));
+    return [
+      { lat:center.lat, lng:center.lng },
+      offsetLatLng(center, offsetM, 0),
+      offsetLatLng(center, -offsetM, 0),
+      offsetLatLng(center, 0, offsetM),
+      offsetLatLng(center, 0, -offsetM)
+    ].map(function(c){ return { center:c, radius:subRadius }; });
+  }
+
+  function fetchAllNearby(places, officeCoord, radius){
+    var grid = buildSearchGrid(officeCoord, radius);
+    return Promise.all(grid.map(function(g){
+      return categorySearchAll(places, g.center, g.radius);
+    })).then(function(resultsPerCell){
+      var byId = {};
+      resultsPerCell.forEach(function(list){
+        list.forEach(function(p){ byId[p.id] = p; });
+      });
+      return Object.keys(byId).map(function(id){ return byId[id]; });
+    });
+  }
+
   function fetchLiveRestaurants(){
     var geocoder = new kakao.maps.services.Geocoder();
     var places = new kakao.maps.services.Places();
@@ -550,11 +596,13 @@
       } else {
         state.railAvailable = false;
       }
-      return categorySearchAll(places, officeCoord, CONFIG.RADIUS_M);
+      return fetchAllNearby(places, officeCoord, CONFIG.RADIUS_M);
     }).then(function(raw){
       return raw.map(function(p){
         var lat = +p.y, lng = +p.x;
-        var distanceM = p.distance ? Number(p.distance) : Math.round(haversine(officeCoord, {lat:lat,lng:lng}));
+        // 여러 지점(그리드)에서 병합한 결과라 카카오가 주는 p.distance는 검색 중심마다 기준점이 달라
+        // 신뢰할 수 없다. 항상 실제 사무실 좌표 기준 haversine 거리로 다시 계산한다.
+        var distanceM = Math.round(haversine(officeCoord, {lat:lat,lng:lng}));
         var side = state.railAvailable ? crossSign(stationA, stationB, {lat:lat,lng:lng}) : null;
         var includedByGeometry = distanceM <= CONFIG.RADIUS_M && (!state.railAvailable || side === state.officeSign);
         return {
@@ -719,9 +767,34 @@
       body.appendChild(el('div','empty-state','아직 불러온 식당이 없어요.'));
       return;
     }
-    state.restaurants.slice().sort(function(a,b){ return (a.distanceM||0)-(b.distanceM||0); }).forEach(function(r){
-      body.appendChild(buildRow(r));
-    });
+    var sorted = state.restaurants.slice().sort(function(a,b){ return (a.distanceM||0)-(b.distanceM||0); });
+    var included = sorted.filter(function(r){ return r.isIncluded; });
+    var excluded = sorted.filter(function(r){ return !r.isIncluded; });
+
+    // 반경 밖 · 철길 반대편(제외 대상)은 애초에 추천 후보로 고려되지 않으므로 목록에서도 기본적으로
+    // 숨긴다. 다만 자동 판정이 경계에서 틀렸을 때 수동으로 "포함"시켜 보정할 수 있어야 하므로
+    // 완전히 없애지는 않고, 펼쳐볼 수 있는 접힘 영역으로만 남겨둔다.
+    if(included.length === 0){
+      body.appendChild(el('div','empty-state','반경 250m·1호선 서쪽 조건에 맞는 식당이 없어요.'));
+    } else {
+      included.forEach(function(r){ body.appendChild(buildRow(r)); });
+    }
+
+    if(excluded.length > 0){
+      var labelFor = function(open){
+        return (open ? '제외된 식당 숨기기' : '제외된 식당 ' + excluded.length + '곳 보기 (반경 밖 · 철길 반대편)');
+      };
+      var wrap = el('div','excluded-wrap');
+      excluded.forEach(function(r){ wrap.appendChild(buildRow(r)); });
+      var toggle = el('button','excluded-toggle', labelFor(false));
+      toggle.type = 'button';
+      toggle.addEventListener('click', function(){
+        var open = wrap.classList.toggle('open');
+        toggle.textContent = labelFor(open);
+      });
+      body.appendChild(toggle);
+      body.appendChild(wrap);
+    }
   }
   function buildRow(r){
     var row = el('div', 'r-row' + (r.isIncluded ? '' : ' excluded'));
