@@ -305,7 +305,14 @@
     RAIL_STATION_B_QUERY: '독산역',
     STORAGE_PREFIX: 'lunch-recommender:v1:',
     SDK_LOAD_TIMEOUT_MS: 4000,
-    WALK_SPEED_M_PER_MIN: 67 // 성인 평균 도보 속도(시속 약 4km) 기준 대략치. 실제 경로 기반이 아닌 직선거리 추정.
+    WALK_SPEED_M_PER_MIN: 67, // 성인 평균 도보 속도(시속 약 4km) 기준 대략치. 실제 경로 기반이 아닌 직선거리 추정.
+    // 카카오맵 비공식 place-api(panel3)를 CORS 우회해서 대신 호출해주는 Cloudflare Worker 프록시.
+    // 카카오 Local API는 메뉴 정보를 제공하지 않아서, 별도로 이 프록시를 통해 실제 메뉴(이름/가격)를
+    // 가져와 보강한다. 응답이 없거나 실패하면 조용히 키워드 추정(TAG_RULES)으로 폴백한다.
+    // 비워두면(빈 문자열) 메뉴 보강 자체를 건너뛴다.
+    MENU_PROXY_URL: 'https://kakao-menu-proxy.01-06.workers.dev/',
+    MENU_FETCH_CONCURRENCY: 6,
+    MENU_CACHE_TTL_MS: 24 * 60 * 60 * 1000 // 24시간 — 같은 식당 재검색 시 프록시 재호출 방지
   };
 
   var TYPE_OPTIONS = ['면','밥','국물','구이','튀김','분식','기타'];
@@ -362,6 +369,7 @@
     mode: 'loading', // 'live' | 'seed' | 'loading'
     selected: { type:[], taste:[], cuisine:[] },
     recentIds: [],
+    currentResultId: null,
     officeSign: null,
     railAvailable: false,
     map: null,
@@ -445,6 +453,7 @@
       },
       signatureMenu: saved.signatureMenu !== undefined ? saved.signatureMenu : (raw.signatureMenu || auto.signatureMenu),
       otherMenu: saved.otherMenu !== undefined ? saved.otherMenu : (raw.otherMenu || []),
+      menuSource: saved.signatureMenu !== undefined ? 'manual' : (raw.menuSource || null),
       edited: !!saved.edited
     };
   }
@@ -608,12 +617,80 @@
         return {
           id: 'kakao:' + p.id, source:'kakao', name: p.place_name, categoryName: p.category_name,
           phone: p.phone, address: p.road_address_name || p.address_name, lat: lat, lng: lng,
-          distanceM: distanceM, placeUrl: p.place_url, railSide: side, includedByGeometry: includedByGeometry
+          distanceM: distanceM, placeUrl: p.place_url, railSide: side, includedByGeometry: includedByGeometry,
+          kakaoPlaceId: p.id // 메뉴 프록시 호출에 필요한 카카오 원본 place id (place.map.kakao.com/{id}와 동일)
         };
       });
     }).then(function(list){
       return { list: list, officeCoord: officeCoord };
     });
+  }
+
+  // ============ 메뉴 보강 (카카오맵 비공식 place-api 프록시) ============
+  // 카카오 Local API(categorySearch 등)는 메뉴 정보를 안 주기 때문에, 별도의 프록시(Cloudflare
+  // Worker, CONFIG.MENU_PROXY_URL)를 통해 카카오맵 웹이 내부적으로 쓰는 비공식 place-api를 호출해
+  // 실제 메뉴(이름/가격/사장님 추천 여부)를 가져온다. 문서화되지 않은 API라 예고 없이 바뀌거나 막힐
+  // 수 있으므로, 개별 요청이 실패해도 전체 흐름은 계속되고 그 식당은 기존 키워드 추정(TAG_RULES)
+  // 결과를 그대로 유지한다. 사용자가 이미 수동으로 편집/저장한 식당은 mergeRecord에서 saved 값이
+  // 최우선이라 이 보강 결과로 덮어써지지 않는다.
+  function menuCacheGet(placeId){
+    var all = storageGet('menuCache', {});
+    var entry = all[placeId];
+    if(!entry || (Date.now() - entry.ts) > CONFIG.MENU_CACHE_TTL_MS) return undefined;
+    return entry.data;
+  }
+  function menuCacheSet(placeId, data){
+    var all = storageGet('menuCache', {});
+    all[placeId] = { data: data, ts: Date.now() };
+    storageSet('menuCache', all);
+  }
+  function formatMenuItem(it){
+    if(!it) return '';
+    return it.price ? (it.name + ' (' + Number(it.price).toLocaleString('ko-KR') + '원)') : it.name;
+  }
+  // 프록시 응답(items[])을 { signature, other } 형태로 변환. 사장님 추천(is_recommend) 항목을
+  // 대표메뉴로, 나머지를 다른메뉴로 삼는다. 추천 표시가 없으면 그냥 첫 항목을 대표메뉴로 쓴다.
+  function toMenuFields(items){
+    if(!items || items.length === 0) return null;
+    var rec = items.filter(function(it){ return it.isRecommend; })[0] || items[0];
+    var others = items.filter(function(it){ return it !== rec; }).map(formatMenuItem);
+    return { signatureMenu: formatMenuItem(rec), otherMenu: others };
+  }
+  function fetchMenuFor(placeId){
+    if(!CONFIG.MENU_PROXY_URL) return Promise.resolve(null);
+    var cached = menuCacheGet(placeId);
+    if(cached !== undefined) return Promise.resolve(cached);
+    var url = CONFIG.MENU_PROXY_URL + (CONFIG.MENU_PROXY_URL.indexOf('?')===-1?'?':'&') + 'placeId=' + encodeURIComponent(placeId);
+    return fetch(url).then(function(resp){
+      if(!resp.ok) throw new Error('menu proxy status ' + resp.status);
+      return resp.json();
+    }).then(function(data){
+      var fields = toMenuFields(data && data.items);
+      menuCacheSet(placeId, fields); // null(메뉴 없음)도 캐싱해서 매번 재호출하지 않음
+      return fields;
+    }).catch(function(err){
+      console.warn('[lunch-recommender] 메뉴 보강 실패 (placeId=' + placeId + '):', err && err.message);
+      return null;
+    });
+  }
+  // rawList(mergeRecord 이전의 원본 배열)를 동시성 제한을 걸어 순회하며 메뉴 필드를 채워 넣는다.
+  // 배열 원소를 직접 mutate하므로, 끝난 뒤 setRestaurants(rawList)를 다시 호출하면 반영된다.
+  function enrichMenus(rawList){
+    var queue = rawList.filter(function(r){ return r.kakaoPlaceId != null; }).slice();
+    function worker(){
+      var item = queue.shift();
+      if(!item) return Promise.resolve();
+      return fetchMenuFor(item.kakaoPlaceId).then(function(fields){
+        if(fields){
+          item.signatureMenu = fields.signatureMenu;
+          item.otherMenu = fields.otherMenu;
+          item.menuSource = 'kakao-live';
+        }
+      }).then(worker);
+    }
+    var pool = [];
+    for(var i=0;i<CONFIG.MENU_FETCH_CONCURRENCY;i++) pool.push(worker());
+    return Promise.all(pool);
   }
 
   // ============ 지도 렌더 ============
@@ -756,6 +833,7 @@
   }
   function onRecommend(){
     var r = pickRandom();
+    state.currentResultId = r ? r.id : null;
     renderResult(r);
     highlightResult(r);
   }
@@ -799,7 +877,9 @@
   function buildRow(r){
     var row = el('div', 'r-row' + (r.isIncluded ? '' : ' excluded'));
     var top = el('div','r-row-top');
-    top.appendChild(el('div','r-row-name', r.name + (r.edited ? '<span class="badge">수정됨</span>' : '')));
+    var badges = (r.edited ? '<span class="badge">수정됨</span>' : '') +
+      (!r.edited && r.menuSource === 'kakao-live' ? '<span class="badge">실시간 메뉴</span>' : '');
+    top.appendChild(el('div','r-row-name', r.name + badges));
     top.appendChild(el('div','r-row-dist', (r.distanceM!=null? r.distanceM+'m':'')));
     row.appendChild(top);
     row.appendChild(el('div','r-row-cat', r.categoryName || ''));
@@ -908,6 +988,25 @@
     if(candidatePool().length > 0){ onRecommend(); } else { renderResult(null); }
   }
 
+  // 카카오 목록은 이미 화면에 그려둔 상태에서, 실제 메뉴를 백그라운드로 마저 받아와 반영한다.
+  // (식당이 많으면 전체 조회에 몇 초 걸릴 수 있어, 먼저 키워드 추정치로 화면을 채워두고 나중에 갱신)
+  function enrichAndRefresh(rawList){
+    if(!CONFIG.MENU_PROXY_URL) return;
+    var foot = $('lastSearchAt');
+    var prevText = foot.textContent;
+    foot.textContent = prevText + ' · 메뉴 불러오는 중…';
+    enrichMenus(rawList).then(function(){
+      setRestaurants(rawList);
+      renderList();
+      updateCtaState();
+      if(state.currentResultId){
+        var current = state.restaurants.filter(function(r){ return r.id === state.currentResultId; })[0];
+        if(current) renderResult(current);
+      }
+      foot.textContent = prevText;
+    });
+  }
+
   function showFallbackBanner(msg){
     var b = $('fallbackBanner');
     b.hidden = false;
@@ -926,6 +1025,7 @@
         hideFallbackBanner();
         setRestaurants(res.list);
         renderAll(res.officeCoord);
+        enrichAndRefresh(res.list);
       })
       .catch(function(err){
         console.warn('[lunch-recommender] 카카오 라이브 검색 실패, 예시 데이터로 대체합니다:', err && err.message);
