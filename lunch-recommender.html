@@ -453,7 +453,14 @@
       },
       signatureMenu: saved.signatureMenu !== undefined ? saved.signatureMenu : (raw.signatureMenu || auto.signatureMenu),
       otherMenu: saved.otherMenu !== undefined ? saved.otherMenu : (raw.otherMenu || []),
-      menuSource: saved.signatureMenu !== undefined ? 'manual' : (raw.menuSource || null),
+      // naverPlaceId만 저장하고 signatureMenu는 직접 타이핑하지 않은 경우, 값은 saved에 있지만
+      // 출처는 'manual'이 아니라 실제 조회 시점(fetchNaverMenuFor)에 결정된 값을 써야 하므로
+      // saved.menuSource를 우선한다. 메인 "저장" 버튼은 항상 menuSource:'manual'을 명시해서 저장한다.
+      menuSource: saved.menuSource || (saved.signatureMenu !== undefined ? 'manual' : (raw.menuSource || null)),
+      // 네이버 place id는 자동 매칭이 불가능해서(공식 검색 API가 place id 자체를 안 줌) 사용자가
+      // "정보 편집"에서 직접 입력해둔 값만 사용한다. 한 번 입력해두면 이후 재검색에서도 유지되고,
+      // enrichMenus가 카카오보다 이 값을 우선해 네이버 메뉴를 조회한다(대개 더 잘 관리돼 있어서).
+      naverPlaceId: saved.naverPlaceId || null,
       edited: !!saved.edited
     };
   }
@@ -656,35 +663,44 @@
     var others = items.filter(function(it){ return it !== rec; }).map(formatMenuItem);
     return { signatureMenu: formatMenuItem(rec), otherMenu: others };
   }
-  function fetchMenuFor(placeId){
+  // cacheNs로 캐시 키를 구분해서 카카오/네이버 메뉴가 서로 캐시를 덮어쓰지 않게 한다.
+  function fetchMenuFrom(proxyParam, placeId, cacheNs, source){
     if(!CONFIG.MENU_PROXY_URL) return Promise.resolve(null);
-    var cached = menuCacheGet(placeId);
-    if(cached !== undefined) return Promise.resolve(cached);
-    var url = CONFIG.MENU_PROXY_URL + (CONFIG.MENU_PROXY_URL.indexOf('?')===-1?'?':'&') + 'placeId=' + encodeURIComponent(placeId);
+    var cacheKey = cacheNs + ':' + placeId;
+    var cached = menuCacheGet(cacheKey);
+    if(cached !== undefined) return Promise.resolve(cached ? Object.assign({}, cached, { source: source }) : null);
+    var url = CONFIG.MENU_PROXY_URL + (CONFIG.MENU_PROXY_URL.indexOf('?')===-1?'?':'&') + proxyParam + '=' + encodeURIComponent(placeId);
     return fetch(url).then(function(resp){
       if(!resp.ok) throw new Error('menu proxy status ' + resp.status);
       return resp.json();
     }).then(function(data){
       var fields = toMenuFields(data && data.items);
-      menuCacheSet(placeId, fields); // null(메뉴 없음)도 캐싱해서 매번 재호출하지 않음
-      return fields;
+      menuCacheSet(cacheKey, fields); // null(메뉴 없음)도 캐싱해서 매번 재호출하지 않음
+      return fields ? Object.assign({}, fields, { source: source }) : null;
     }).catch(function(err){
-      console.warn('[lunch-recommender] 메뉴 보강 실패 (placeId=' + placeId + '):', err && err.message);
+      console.warn('[lunch-recommender] 메뉴 보강 실패 (' + cacheNs + '=' + placeId + '):', err && err.message);
       return null;
     });
   }
+  function fetchMenuFor(placeId){ return fetchMenuFrom('placeId', placeId, 'kakao', 'kakao-live'); }
+  function fetchNaverMenuFor(placeId){ return fetchMenuFrom('naverPlaceId', placeId, 'naver', 'naver-live'); }
   // rawList(mergeRecord 이전의 원본 배열)를 동시성 제한을 걸어 순회하며 메뉴 필드를 채워 넣는다.
-  // 배열 원소를 직접 mutate하므로, 끝난 뒤 setRestaurants(rawList)를 다시 호출하면 반영된다.
+  // 네이버 place id가 수동으로 입력돼 있으면(대개 상점주가 더 잘 관리해둠) 그쪽을 우선 시도하고,
+  // 없거나 실패하면 카카오 실시간 메뉴로 폴백한다. 배열 원소를 직접 mutate하므로, 끝난 뒤
+  // setRestaurants(rawList)를 다시 호출하면 반영된다.
   function enrichMenus(rawList){
-    var queue = rawList.filter(function(r){ return r.kakaoPlaceId != null; }).slice();
+    var queue = rawList.filter(function(r){ return r.kakaoPlaceId != null || r.naverPlaceId; }).slice();
     function worker(){
       var item = queue.shift();
       if(!item) return Promise.resolve();
-      return fetchMenuFor(item.kakaoPlaceId).then(function(fields){
+      var task = item.naverPlaceId
+        ? fetchNaverMenuFor(item.naverPlaceId).then(function(fields){ return fields || (item.kakaoPlaceId ? fetchMenuFor(item.kakaoPlaceId) : null); })
+        : fetchMenuFor(item.kakaoPlaceId);
+      return task.then(function(fields){
         if(fields){
           item.signatureMenu = fields.signatureMenu;
           item.otherMenu = fields.otherMenu;
-          item.menuSource = 'kakao-live';
+          item.menuSource = fields.source;
         }
       }).then(worker);
     }
@@ -877,8 +893,9 @@
   function buildRow(r){
     var row = el('div', 'r-row' + (r.isIncluded ? '' : ' excluded'));
     var top = el('div','r-row-top');
+    var menuBadgeLabel = r.menuSource === 'naver-live' ? '네이버 메뉴' : (r.menuSource === 'kakao-live' ? '카카오 실시간 메뉴' : '');
     var badges = (r.edited ? '<span class="badge">수정됨</span>' : '') +
-      (!r.edited && r.menuSource === 'kakao-live' ? '<span class="badge">실시간 메뉴</span>' : '');
+      (!r.edited && menuBadgeLabel ? '<span class="badge">' + menuBadgeLabel + '</span>' : '');
     top.appendChild(el('div','r-row-name', r.name + badges));
     top.appendChild(el('div','r-row-dist', (r.distanceM!=null? r.distanceM+'m':'')));
     row.appendChild(top);
@@ -945,6 +962,40 @@
     });
     form.appendChild(cuisineSelect);
 
+    // 네이버 place id: 자동 매칭이 안 돼서(공식 검색 API에 place id 자체가 없음) 수동 입력만
+    // 지원한다. 한 번 입력해두면 이후 재검색에서도 유지되고, enrichMenus가 카카오보다 이 값을
+    // 우선해 네이버 메뉴를 자동 조회한다(대개 카카오보다 상점주가 더 신경 써서 관리해둠).
+    form.appendChild(el('label', null, '네이버 place id (선택 — 네이버지도 URL의 숫자, 또는 링크 전체 붙여넣기)'));
+    var naverRow = el('div'); naverRow.style.display = 'flex'; naverRow.style.gap = '6px';
+    var naverIdInput = el('input'); naverIdInput.type = 'text'; naverIdInput.style.flex = '1';
+    naverIdInput.placeholder = '예: 38693015';
+    naverIdInput.value = r.naverPlaceId || '';
+    var naverSaveBtn = el('button', 'btn btn-outline', '저장 & 조회');
+    naverSaveBtn.type = 'button';
+    naverSaveBtn.style.flex = 'none';
+    naverSaveBtn.addEventListener('click', function(){
+      var m = naverIdInput.value.match(/(\d{5,})/);
+      var naverPlaceId = m ? m[1] : '';
+      if(!naverPlaceId){ alert('숫자로 된 네이버 place id를 찾을 수 없어요. 네이버지도 URL(pcmap.place.naver.com/restaurant/숫자/...)을 확인해주세요.'); return; }
+      var saved = saveOverride(r.id, { naverPlaceId: naverPlaceId });
+      r.naverPlaceId = saved.naverPlaceId;
+      naverSaveBtn.disabled = true; naverSaveBtn.textContent = '조회 중…';
+      fetchNaverMenuFor(naverPlaceId).then(function(fields){
+        naverSaveBtn.disabled = false; naverSaveBtn.textContent = '저장 & 조회';
+        if(fields){
+          r.signatureMenu = fields.signatureMenu; r.otherMenu = fields.otherMenu; r.menuSource = fields.source;
+          sigInput.value = r.signatureMenu;
+          otherInput.value = r.otherMenu.join(', ');
+          renderList(); updateCtaState();
+        } else {
+          alert('메뉴를 찾지 못했어요. place id가 맞는지, 그 식당에 메뉴 탭이 있는지 확인해주세요.');
+        }
+      });
+    });
+    naverRow.appendChild(naverIdInput);
+    naverRow.appendChild(naverSaveBtn);
+    form.appendChild(naverRow);
+
     form.appendChild(el('label', null, '추천메뉴 (대표메뉴 1개)'));
     var sigInput = el('input'); sigInput.type='text'; sigInput.value = r.signatureMenu || '';
     form.appendChild(sigInput);
@@ -962,6 +1013,7 @@
         tags: { type: localType, taste: tasteSelect.value, cuisine: cuisineSelect.value },
         signatureMenu: sigInput.value.trim(),
         otherMenu: otherMenu,
+        menuSource: 'manual',
         edited: true
       };
       var saved = saveOverride(r.id, patch);
@@ -992,6 +1044,14 @@
   // (식당이 많으면 전체 조회에 몇 초 걸릴 수 있어, 먼저 키워드 추정치로 화면을 채워두고 나중에 갱신)
   function enrichAndRefresh(rawList){
     if(!CONFIG.MENU_PROXY_URL) return;
+    // 사용자가 "정보 편집"에서 저장해둔 naverPlaceId(overrides)는 raw 객체엔 없고 이미 병합된
+    // state.restaurants에만 있으므로, enrichMenus가 참조할 수 있게 raw 쪽에 복사해 넣는다.
+    var byId = {};
+    state.restaurants.forEach(function(r){ byId[r.id] = r; });
+    rawList.forEach(function(raw){
+      var merged = byId[raw.id];
+      if(merged && merged.naverPlaceId) raw.naverPlaceId = merged.naverPlaceId;
+    });
     var foot = $('lastSearchAt');
     var prevText = foot.textContent;
     foot.textContent = prevText + ' · 메뉴 불러오는 중…';

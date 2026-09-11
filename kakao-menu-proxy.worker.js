@@ -36,12 +36,23 @@ function json(obj, status = 200, extraHeaders = {}) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });
     }
 
     const url = new URL(request.url);
+
+    // 네이버 플레이스 메뉴 조회. 네이버 지역검색 API는 place id를 안 주기 때문에(공식 API의
+    // 근본적 한계로 확인됨) 자동 매칭은 포기하고, 사용자가 앱에서 직접 입력해둔 네이버 place id로만
+    // 호출한다. place.naver.com/restaurant/{id}/menu/list 페이지는 SSR이라 카카오처럼 CORS로
+    // 막혀있지 않고, window.__APOLLO_STATE__ 안에 메뉴 데이터(이름/가격/대표메뉴 여부)가 그대로
+    // 박혀서 온다 — 그걸 파싱해서 카카오 메뉴 응답과 동일한 스키마로 맞춰 반환한다.
+    const naverPlaceId = url.searchParams.get('naverPlaceId');
+    if (naverPlaceId) {
+      return handleNaverMenu(naverPlaceId);
+    }
+
     const placeId = url.searchParams.get('placeId');
 
     if (!placeId || !/^\d+$/.test(placeId)) {
@@ -115,3 +126,70 @@ export default {
     return response;
   },
 };
+
+// 네이버 place 메뉴 페이지(SSR)를 가져와 __APOLLO_STATE__에서 Menu 타입 항목만 추출한다.
+async function handleNaverMenu(naverPlaceId) {
+  if (!/^\d+$/.test(naverPlaceId)) {
+    return json({ error: 'naverPlaceId는 숫자만 가능합니다.' }, 400);
+  }
+
+  const cache = caches.default;
+  const cacheUrl = 'https://kakao-menu-proxy.internal/naver-menu?id=' + naverPlaceId;
+  const cacheKey = new Request(cacheUrl);
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const pageUrl = 'https://pcmap.place.naver.com/restaurant/' + naverPlaceId + '/menu/list';
+  let resp;
+  try {
+    resp = await fetch(pageUrl, {
+      headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'ko-KR,ko;q=0.9',
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+      },
+    });
+  } catch (e) {
+    return json({ error: '네이버 페이지 요청 실패', detail: String(e) }, 502);
+  }
+  if (!resp.ok) {
+    return json({ error: `naver page status ${resp.status}` }, 502);
+  }
+
+  const html = await resp.text();
+  const m = html.match(/window\.__APOLLO_STATE__\s*=\s*(\{[\s\S]*?\});\s*\n/);
+  if (!m) {
+    return json({ error: 'APOLLO_STATE not found (페이지 구조가 바뀌었을 수 있음)' }, 502);
+  }
+
+  let apollo;
+  try {
+    apollo = JSON.parse(m[1]);
+  } catch (e) {
+    return json({ error: 'APOLLO_STATE 파싱 실패', detail: String(e) }, 502);
+  }
+
+  const menuItems = Object.keys(apollo)
+    .map((k) => apollo[k])
+    .filter((v) => v && v.__typename === 'Menu')
+    .sort((a, b) => (a.index || 0) - (b.index || 0));
+
+  const result = {
+    placeId: naverPlaceId,
+    items: menuItems.map((it) => ({
+      name: it.name,
+      price: it.price != null && it.price !== '' ? Number(it.price) : null,
+      isRecommend: !!it.recommend,
+      recommendReasons: [],
+      description: it.description || null,
+      photoUrl: (it.images && it.images[0]) || null,
+    })),
+  };
+
+  const response = json(result, 200, {
+    'Cache-Control': `public, max-age=${CACHE_SECONDS}`,
+  });
+  await cache.put(cacheKey, response.clone());
+  return response;
+}
